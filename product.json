@@ -116,21 +116,13 @@
 		},
 		"providerUriSetting": "github-enterprise.uri",
 		"providerScopes": [
-			[
-				"user:email"
-			],
-			[
-				"read:user"
-			],
-			[
-				"read:user",
-				"user:email",
-				"repo",
-				"workflow"
-			]
+			["user:email"],
+			["read:user"],
+			["read:user", "user:email", "repo", "workflow"]
 		],
 		"entitlementUrl": "https://api.github.com/copilot_internal/user",
 		"entitlementSignupLimitedUrl": "https://api.github.com/copilot_internal/subscribe_limited_user",
+		"customAgentsUrl": "https://api.githubcopilot.com/agents/swe/custom-agents",
 		"chatQuotaExceededContext": "github.copilot.chat.quotaExceeded",
 		"completionsQuotaExceededContext": "github.copilot.completions.quotaExceeded",
 		"walkthroughCommand": "github.copilot.open.walkthrough",

@@ -371,6 +371,7 @@ export interface IDefaultChatAgent {
 
 	readonly entitlementUrl: string;
 	readonly entitlementSignupLimitedUrl: string;
+	readonly customAgentsUrl?: string;
 
 	readonly chatQuotaExceededContext: string;
 	readonly completionsQuotaExceededContext: string;

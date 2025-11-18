@@ -18,6 +18,7 @@ import { IStorageService, StorageScope, StorageTarget } from '../../../../platfo
 import { IChatAgentService } from './chatAgents.js';
 import { ChatContextKeys } from './chatContextKeys.js';
 import { ChatModeKind } from './constants.js';
+import { ICustomAgentData, ICustomAgentsService } from './customAgents.js';
 import { IHandOff } from './promptSyntax/promptFileParser.js';
 import { IAgentSource, ICustomAgent, IPromptsService, PromptsStorage } from './promptSyntax/service/promptsService.js';
 
@@ -39,6 +40,7 @@ export class ChatModeService extends Disposable implements IChatModeService {
 
 	private readonly hasCustomModes: IContextKey<boolean>;
 	private readonly _customModeInstances = new Map<string, CustomChatMode>();
+	private readonly _apiCustomModeInstances = new Map<string, CustomChatMode>();
 
 	private readonly _onDidChangeChatModes = new Emitter<void>();
 	public readonly onDidChangeChatModes = this._onDidChangeChatModes.event;
@@ -48,7 +50,8 @@ export class ChatModeService extends Disposable implements IChatModeService {
 		@IChatAgentService private readonly chatAgentService: IChatAgentService,
 		@IContextKeyService contextKeyService: IContextKeyService,
 		@ILogService private readonly logService: ILogService,
-		@IStorageService private readonly storageService: IStorageService
+		@IStorageService private readonly storageService: IStorageService,
+		@ICustomAgentsService private readonly customAgentsService: ICustomAgentsService
 	) {
 		super();
 
@@ -62,6 +65,9 @@ export class ChatModeService extends Disposable implements IChatModeService {
 			void this.refreshCustomPromptModes(true);
 		}));
 		this._register(this.storageService.onWillSaveState(() => this.saveCachedModes()));
+
+		// Fetch custom agents from API
+		void this.refreshApiCustomAgents(true);
 
 		// Ideally we can get rid of the setting to disable agent mode?
 		let didHaveToolsAgent = this.chatAgentService.hasToolsAgent;
@@ -155,11 +161,90 @@ export class ChatModeService extends Disposable implements IChatModeService {
 				}
 			}
 
-			this.hasCustomModes.set(this._customModeInstances.size > 0);
+			this.hasCustomModes.set(this._customModeInstances.size > 0 || this._apiCustomModeInstances.size > 0);
 		} catch (error) {
 			this.logService.error(error, 'Failed to load custom agents');
 			this._customModeInstances.clear();
-			this.hasCustomModes.set(false);
+			this.hasCustomModes.set(this._apiCustomModeInstances.size > 0);
+		}
+		if (fireChangeEvent) {
+			this._onDidChangeChatModes.fire();
+		}
+	}
+
+	private async refreshApiCustomAgents(fireChangeEvent?: boolean): Promise<void> {
+		try {
+			const apiAgents = await this.customAgentsService.fetchCustomAgents({
+				exclude_invalid_config: true,
+				dedupe: true
+			}, CancellationToken.None);
+
+			// Convert API agents to custom modes
+			const seenIds = new Set<string>();
+
+			// Add a test entry to verify the dropdown is working
+			const testAgent: ICustomAgent = {
+				uri: URI.parse('api:test/test/test-agent'),
+				name: 'test-agent',
+				description: 'Test agent from API',
+				tools: ['*'],
+				model: undefined,
+				argumentHint: undefined,
+				agentInstructions: {
+					content: 'This is a test agent to verify API integration is working',
+					toolReferences: []
+				},
+				handOffs: undefined,
+				target: undefined,
+				source: { storage: PromptsStorage.local }
+			};
+			const testModeInstance = new CustomChatMode(testAgent);
+			this._apiCustomModeInstances.set('api:test/test/test-agent', testModeInstance);
+			seenIds.add('api:test/test/test-agent');
+
+			for (const apiAgent of apiAgents) {
+				const agentId = `api:${apiAgent.repo_owner}/${apiAgent.repo_name}/${apiAgent.name}`;
+				seenIds.add(agentId);
+
+				// Convert API agent to ICustomAgent format
+				const customAgent: ICustomAgent = {
+					uri: URI.parse(agentId),
+					name: apiAgent.name,
+					description: apiAgent.description,
+					tools: apiAgent.tools,
+					model: undefined,
+					argumentHint: apiAgent.argument_hint,
+					agentInstructions: {
+						content: apiAgent.description,
+						toolReferences: [],
+						metadata: apiAgent.metadata
+					},
+					handOffs: undefined,
+					target: apiAgent.target,
+					source: { storage: PromptsStorage.local }
+				};
+
+				let modeInstance = this._apiCustomModeInstances.get(agentId);
+				if (modeInstance) {
+					modeInstance.updateData(customAgent);
+				} else {
+					modeInstance = new CustomChatMode(customAgent);
+					this._apiCustomModeInstances.set(agentId, modeInstance);
+				}
+			}
+
+			// Clean up instances for modes that no longer exist
+			for (const [agentId] of this._apiCustomModeInstances.entries()) {
+				if (!seenIds.has(agentId)) {
+					this._apiCustomModeInstances.delete(agentId);
+				}
+			}
+
+			this.hasCustomModes.set(this._customModeInstances.size > 0 || this._apiCustomModeInstances.size > 0);
+		} catch (error) {
+			this.logService.error(error, 'Failed to load API custom agents');
+			this._apiCustomModeInstances.clear();
+			this.hasCustomModes.set(this._customModeInstances.size > 0);
 		}
 		if (fireChangeEvent) {
 			this._onDidChangeChatModes.fire();
@@ -174,7 +259,9 @@ export class ChatModeService extends Disposable implements IChatModeService {
 	}
 
 	findModeById(id: string | ChatModeKind): IChatMode | undefined {
-		return this.getBuiltinModes().find(mode => mode.id === id) ?? this._customModeInstances.get(id);
+		return this.getBuiltinModes().find(mode => mode.id === id) ??
+			this._customModeInstances.get(id) ??
+			this._apiCustomModeInstances.get(id);
 	}
 
 	findModeByName(name: string): IChatMode | undefined {
@@ -194,7 +281,14 @@ export class ChatModeService extends Disposable implements IChatModeService {
 	}
 
 	private getCustomModes(): IChatMode[] {
-		return this.chatAgentService.hasToolsAgent ? Array.from(this._customModeInstances.values()) : [];
+		if (!this.chatAgentService.hasToolsAgent) {
+			return [];
+		}
+		// Combine both local file-based custom modes and API-fetched custom agents
+		return [
+			...Array.from(this._customModeInstances.values()),
+			...Array.from(this._apiCustomModeInstances.values())
+		];
 	}
 }
 
